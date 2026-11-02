@@ -1,0 +1,323 @@
+---
+name: "fsales"
+description: "Handle any update to Tern's Freshsales from a list of contacts, deals or accounts, or from a meeting transcript or audio: add or enrich contacts, create deals or advisor accounts, link, merge, rename, reopen, delete, screen out. Bundles the `fs` CLI, which calls the Freshsales API directly with no Zapier. Replaces the retired fs-update skill."
+---
+
+# fsales
+
+One router skill for every change to Tern Capital's Freshsales (tern.freshworks.com), made with the `fs` CLI that is bundled in this skill's folder (`./fs`; full command reference in `references/cli-readme.md`). 
+It replaces the retired `fs-update` skill. Thread-based status updates (the FSU label) stay with fs-updates-from-email.
+
+**Where the CLI is.** `fs`, `fs_cli/` and `requirements.txt` sit next to this file, in the "Base directory" shown when the skill loads. 
+Run everything as `cd <base directory> && python3 fs ...`. The `fs` file is not executable in the synced copy, so `./fs` fails with Permission denied. It needs Python 3.9+ and `requests` (`pip install --break-system-packages -r requirements.txt` if the import fails). 
+If the code needs changing, do so here and commit as needed.
+
+Input can be: a pasted list or free text, a CSV/Excel/Google Sheet, a screenshot of a list, a meeting transcript or audio file of one or more meetings (see 0d), or free-form edit instructions on existing records (rename, merge, set a field, change owner or stage, delete). Each item is a contact (has an email or a person's name), a deal or company name, or an account name.
+
+Working style: British English, direct. Propose a short structured plan in text first, get ONE confirmation per batch, then execute and verify. Write structured text before any table or CSV.
+
+## 0. How the CLI works (read this once per session)
+
+- **Every write is a dry run until `--apply`.** The dry run prints a diff (`before / after`, with `OVERWRITE`, `default`, `DELETE` and `MERGE` flags), `WARNING` lines and `INVALID` lines. Show it, wait for the single confirmation for the batch, then re-run with `--apply`. `--apply` re-validates, sends, and prints a `field / intended / actual` table; any `DID NOT TAKE` is a failure to report. One INVALID item stops the whole batch from being sent.
+- **Exception to "wait for confirmation":** when Karthik gives a numbered list of explicit per-record instructions (delete X, move Y, add Z), that list is the confirmation: show each dry run and apply straight away, then report. The delete and merge guards below still apply. The same goes for a direct instruction such as "reopen it", "merge now", "assign it to me" or "look them up": do the dry run, apply, report.
+- First write of a session: run `./fs picklists` (and read any `INVALID ... Valid: [...]` list), because Freshsales silently ignores an invalid picklist value. The CLI already refuses them.
+- Auth: in a cloud session `FS_AUTH_VIA_PROXY=1` with the tern.freshworks.com network secret; elsewhere `FS_API_KEY` in the environment or the gitignored `.env`. Never print or commit the key.
+- **API budget.** Freshsales allows about 2000 calls an hour for the WHOLE account (Zapier and other users share it) and each request costs one call, whatever its size. Every run ends with `API calls this run: N ... account has X of 2000 left`. Prefer one call that returns more: `lookup ... --brief`, `list-view` and `check-contacts --view` (100 contacts a call), `--stop-after`, batches (`--batch FILE`), and `find-deals` without `--details`. Never loop `lookup` per email or read contacts one by one when a view or batch will do. A note costs about 2 calls (1 read, 1 write); a dry-run plus apply of a batch costs double, so dry-run batches once. If the line shows the pool is low, tell Karthik and stop sweeping.
+- Metadata (fields, picklists, stages, views) is cached for an hour; `./fs --refresh ...` refetches it if Freshsales' picklists were just changed.
+- Reads: `lookup EMAILS [--brief]`, `find-contacts [--name|--email|--city|--type|--domain] [--full]`, `contact IDS`, `deal IDS`, `account ID`, `find-deals TERMS [--details]`, `views [--entity deals|accounts]`, `list-view VIEW_ID --where ... --fields ...`, `check-contacts`, `picklists`.
+- Writes: `create-contact|create-deal|create-account [--preset P] --set k=v ...`, `update-contact|update-deal|update-account ID --set k=v ...`, `add-note ID TEXT --on contact|deal|account`, `add-note --batch FILE` (JSON list of `{"id":..., "on":"contact|deal", "text":"..."}`), `link-deal-contacts DEAL --add IDS --remove IDS`, `delete-contact|delete-deal|delete-account IDS`, `merge-contacts PRIMARY --with IDS`.
+- Presets carry the defaults below and show as `default` in the diff: `target-contact`, `advisor-contact`, `target-deal`, `advisor-account`. Any `--set` overrides them. Multi-selects (such as Account Type) take `;`-joined values: `--set "cf_type=SO-CF;AD-A&T"`. `--set key=` (empty) clears a field. Choice fields (`owner`, `stage`, ...) take the name. On deals `stage` and `deal_stage` are the same key.
+- **Companies House: the `ch` CLI first, Exa only as a fallback (Oct 2026).** Every Companies House lookup starts with `python3 ch ...` in this skill's folder (needs `CH_API_KEY`). It reads the official API: all 34 Public Data API endpoints, plus the Document API for filing PDFs. Use Exa `web_fetch_exa` only when the API cannot answer (for example the Gazette, or a page the API does not hold), and say so when you do. Command reference: `references/companies-house.md`. Quick map: `search-companies NAME`, `profile NUM`, `psc NUM`, `officers NUM`, `filings NUM`, `charges NUM`, `insolvency NUM`, `company-all NUM` for everything at once.
+- Tools that are not Freshsales stay as before: Apollo, Superhuman, Google Sheets.
+
+## 0e. What changed in the 26 Oct 2026 session (read before the first write)
+
+- **Stage IDs changed.** `02 Screened Out` replaced `18 Screened Out`. `04 Plan-Teaser-Chasing` replaced `04 Plan-Teaser/Suspect`. On 26 Oct `18` was noted as `18 Live-GTM`, but the live pipeline read on 31 Oct had no `18` (see the stage list under Fixed names). The CLI's `INVALID ... Valid: [...]` line is the source of truth.
+- **Deal industry (`cf_industry` on deals)** takes: Public Sector-Health & Care, Public Sector-Non Health & Care, Retail, Transportation, Real Estate/Construction, Hospitality, Compliance, ERP Add-on, Other-Education, Other-Energy & Utilities, Other-Financial Services, Other-Manufacturing, Other-Media, Other-Unknown, Industry Agnostic. `Professional Services` is rejected. Use `Industry Agnostic` for horizontal IT services and `Other-Unknown` when unsure.
+- **Deals have no `cf_deal_currency`.** The `target-deal` preset used to set it and blocked every deal create. It has been removed from `fs_cli/creates.py`, and the preset stage default changed to `04 Plan-Teaser-Chasing`. Keep both fixes if `fs_cli/creates.py` is ever regenerated.
+- **Screened Out deals and contacts.** The first create of a Screened Out deal with no contact was refused: `Related contacts can't be empty`. The identical payload then succeeded on retry. Retry once. If it is still refused, link a contact (the owner or director, found as in section 4) and tell Karthik.
+- **"Latest created" deals.** The Recent Deals view (13000351433) is ordered by recent activity, not creation. To find the newest deals, read every page (`list-view 13000351433 --entity deals --max-pages 3 --fields id,name,created_at`) and sort by `created_at` in your own code.
+- **Ownership checks.** Run `python3 ch psc NUMBER` (and `psc-get NUMBER KIND ID` for one notification). Follow corporate PSCs up to individuals: take the corporate PSC's `identification.registration_number`, run `ch psc` on it, and repeat. Look at the notified dates: a recent change of holder, or a new voting-rights holder in a holding company, is a flag to show Karthik.
+- **Apollo routine.** Run `apollo_users_api_profile` with `include_waterfall_capability=true` once per conversation. Find people with `apollo_mixed_people_api_search` by `q_organization_domains_list` (free, returns ids and obfuscated surnames). Then `apollo_people_match` with the `id` gives the work email and `email_status`. Skip anyone whose status is `unavailable`, since they can't be added without a phone or a paid waterfall. Each match costs about one credit. The reply may not include an `mcp_credits` block, so say the balance is unconfirmed.
+- **Prior contact.** Superhuman `list_threads` with `to` and `from` set to the company domain and the contact's email. Report "no prior threads" when there are none.
+- **Drafts.** `create_or_update_draft` with `type: new` and `instructions`, never a send. Tell Karthik the draft is waiting for review, and list anything you assumed about the purpose or his title.
+- **Evidence notes.** `add-note DEAL_ID "DD/MM: ..." --on deal --apply`, one note per deal. Put the ownership chain, fit call, size flags and any unverified data in it.
+- **Working sequence for "screen and add".** (1) `find-deals` duplicate check on each name. (2) Ownership chain and fit call. (3) Live deal: Apollo search, match, `create-contact --preset target-contact` with `cf_apollo_person_id` and `cf_email_status=verified`, then a dry run of `create-deal --set contacts=ID`, apply, verify, add the note. (4) Screened Out: `create-deal` with the reject reason, add the note, no contact unless refused.
+
+## 0f. What changed in the 31 Oct 2026 session (read before the first write)
+
+- **Name search misses real contacts.** In one batch `find-contacts --name SURNAME` said "not found" for eight people who were in Freshsales (Heather Cook, Kieran Innes, Ravi Kumar, Ian Austin, Callum Murray, Rik Hudson, Scott Barton, Mark Williams). It is capped (it shows 25) and the index misses records. Never tell Karthik "not in FS" from a name search alone.
+- **Order for finding an existing contact.** (1) `lookup EMAILS --brief` with every address you hold, including the Apollo-verified one. (2) `find-deals` on the company, then `deal ID` to read its linked contacts: this is the dependable route. (3) `find-contacts --name "First Last"` plus `--domain`, and compare `total` with `shown`. Only then call a person "not in FS", and say which steps you ran.
+- **When Apollo cannot find the right person, use Exa before asking Karthik (his rule, 31 Oct 2026).** This covers no match, a low-confidence match with no employment history, a different current employer, and a company whose domain search returns nothing. Use `web_search_exa` with `category:people` plus the company name and role, the company's own site and press pages, theorg.com, and LinkedIn posts announcing appointments. Cross-check with `ch officers`. Then verify the email with a standard Apollo match on the LinkedIn URL (about 1 credit). Tootoot (Lucy Harvey, CEO from June 2026) was found only this way. Ask Karthik only if Exa also fails.
+- **The right contact is not always a director.** Companies House lists investors and non-executives (Tootoot's Catherine Bennett is an Access Group general manager) and may omit the CEO altogether (Lucy Harvey is not a director). Rank: current CEO or owner, then a co-founder who is a director, then a non-executive. Confirm the person still works there: Apollo `employment_history` with `current: true`, a resignation date in `ch officers`, and LinkedIn. Apollo and Companies House can disagree (Ravi Kumar: Apollo says he left, Companies House still lists him as a director). Report both and let Karthik decide.
+- **Retry Apollo with spelling and name variants** before giving up: "Llyod" matched only as "Lloyd"; Freshsales "Steve" is Apollo "Steven". Use the company domain, not only the name.
+- **Sheet, Freshsales and Apollo can all be wrong.** Karthik's rule: find the right value from LinkedIn and Apollo. Apply an Apollo value only when `match_confidence` is high and the current employer matches. Skip it for low confidence, no employment history, or a different employer, and list it as flagged. For a person's city, prefer the company's location when two of the three sources agree, and always list city conflicts in the report.
+- **A "Chase" list must not overwrite outreach history (Karthik, 31 Oct 2026).** The dry run flags `OVERWRITE` where a contact already has a status such as `3rd Contact-Email/LI`. Set Reachout Status `Chase` only where it is blank or already Chase; keep the freshest status otherwise and list those contacts. Write the batch file without `cf_rereachout` for them.
+- **`cf_email_status` takes only `verified`, `guessed`, `unavailable`, `extrapolated`.** `unverified` is rejected. Use `verified` for an Apollo-verified address and `guessed` for an address that came only from a sheet or a pattern.
+- **`cf_primary_contact` belongs to the contact, not the deal.** Setting it true makes that person primary on every deal they are linked to. When Karthik makes someone the main contact, set the previous primary to false on that deal's other contact. "Make the owner" means primary contact plus Contact Type `TG-Owner/Manager`; say that was the reading.
+- **Replacing a contact on a deal.** Create and link the new person, verify the link, then `link-deal-contacts DEAL --remove OLD`, then `delete-contact OLD`. A live deal must never be left with no contact. Do not delete someone who is still an active director or has deal notes without telling Karthik; deal notes block `delete-contact` with no override, so leave the contact linked or unlink only. A deal with no contact at all (E-cargoware, stage 52) is a live deal missing its contact: fix it when you see it.
+- **Delete guard stage list.** `fs_cli/removes.py` still held `18` (the old Screened Out code), so a Screened Out deal showed as `LIVE`, and a live `18` deal could count as dead. Fixed: the dead codes are `02`, `64`, `68`, `72`, `76`, `80`. Keep this in step with the pipeline if stages change again.
+- **Batch updates.** One batch file for all contacts: `[{"id": N, "set": {"linkedin": "slug", "city": "X", "cf_rereachout": "Chase"}}]`. Dry-run once (about one call per contact), read the `OVERWRITE` rows, drop what Karthik would not want, then `--apply`. Items with nothing to change are skipped and print no verification line.
+- **Do not trust truncated output.** Never pipe `lookup` or `find-contacts` through `tail`. Parse `ch` output with a tolerant parser (items can lack `company_status`; `ch search-companies "A B Ltd"` returned HTTP 416 once, a single lower-case word worked).
+- **Apollo drops out.** The connection dropped and reconnected twice. Large results are saved to a file under the session's `tool-results` folder: read that file instead of re-running a paid call.
+- **Credits.** Apollo may return no `mcp_credits` block. Add up `credits_consumed` from each response and say the balance is unconfirmed.
+
+## 0a. Standing rules
+
+- Defaults (state them in the plan so Karthik can override): owner Karthik Dasari, Deal Source Direct, Bolt-on Yes, Bolt-on Platform Other. When linking contacts to an EXISTING deal owned by Simon (Bolster, Ticketline, Oct 2026), leave deal and contact owner as Simon and say so.
+- **NEVER create or update a LIVE deal without relevant contact(s) associated with it (Karthik, 20 Oct 2026).** A live deal is any deal not at stage 02 Screened Out: new Suspects, reopened deals, parked deals (52) and deals being edited. Before any `create-deal` or `update-deal` on one, check it has at least one linked contact (`./fs deal ID`, or `--set contacts=...` on create). If it has none, find the owner/CEO first (section 4: Companies House PSC plus Apollo; reuse an existing FS contact when there is one), create them as TG-Owner/Manager (section 5), link them, and only then write the deal. If no contact can be found, do not write the deal: tell Karthik and ask. **Exception: Screened Out deals (stage 02) do not need a contact** (Karthik, 20 Oct 2026); create them with no contacts and no Apollo spend, as in section 3. A live deal I created earlier in the same session without a contact must be fixed straight away. Check for stray look-alike contacts before reusing one: an FS contact with the right name but a wrong country, personal email or no company is a different person (a stray "Chris Pywell", Netherlands, was not the Nuweb chairman).
+- Plan first, one confirm per batch. Anything ambiguous gets a multiple-choice question with my best guess first.
+- Write failure or dropped connection: retry once (first check the record does not already exist, never create a duplicate; note search lags new records by a few minutes, so look a second time with `contact ID` if you hold the id), carry on with the batch, list failures with the error at the end.
+- Apollo: free people search and standard match (about 1 credit) by default. `apollo_mixed_people_api_search` is free but returns obfuscated surnames and no emails; take the Apollo `id` from it and pass the id to `apollo_people_bulk_match` (about 1 credit each, max 10 per call). A standard `apollo_people_match` with first name, last name and the company domain or name is the quickest for one named person (Will Watt, Barrie Taylor). Ask before any waterfall email/phone (about 10 credits each). Always surface the `mcp_credits` block and the balance. An `extrapolated` email status means Apollo guessed it (Chris Pywell, confidence 0.6): add it only flagged as unverified in the contact and deal notes.
+- Explicit instructions from Karthik win over my judgement (do as told, flag conflicts such as a future GTM date). Exception: a company he names that fails the fit screen still gets screened (section 3), unless he then explicitly says to reopen or assign it (Nu Tickets, Optima and Volunteero, Oct 2026).
+- Never expose these as guesses: Contact Type, reachout statuses. Infer from evidence and show the choice in the plan.
+- **Do not overwrite an existing Reachout Status with `Chase` (Karthik, 31 Oct 2026).** Chase goes on blank statuses only; keep the freshest status and list the contacts left alone (see 0f).
+- **Apollo cannot find the right person: use Exa next (Karthik, 31 Oct 2026),** then ask only if that also fails (see 0f).
+- **Apollo-verified email beats the Freshsales address (Oct 2026).** Freshsales addresses are often guesses. In the Manchester outreach batch Apollo corrected six addresses and showed one contact (Bolster's Joseph Bramwell) now working at a different company; earlier examples were MiTEQ (awhiting@ bounced, alex.whiting@ verified) and KPR (d.marla@ bounced, d.clapp@ correct). When enriching or linking a contact, run an Apollo match, compare with the FS primary email, and show any mismatch in the plan. Change it only after approval with `update-contact ID --set email=new@x.com`: the new address becomes primary and every old address stays as a secondary (the CLI sends them all back, because Freshsales deletes any address left out of an update). This matters because outreach BCCs to dasari+5yzvble@tern.freshworks.com only log against the contact whose FS email matches the address emailed. The CLI refuses an address that already belongs to another contact and names the `merge-contacts` command to use.
+- **Do not touch a company or contact that belongs to a live deal or due diligence without asking (Oct 2026).** Before editing, merging or re-staging a record whose name or email domain resembles a business Tern is in discussions or DD with (for example CODAS's contact at cds-systems.co.uk versus Corporate Data Services, under exclusivity, and not Curium Data Systems), read the matching memory file or the FS deal, confirm they are different entities, and flag it. `delete-contact` enforces its own version of this (section 8); edits and merges do not, so the check is yours.
+
+## 0b. SO-CF priority and status rules (Karthik, Oct 2026)
+
+These apply whenever an update involves a contact whose Contact Type is `SO-CF`, and to SO-CF contacts only (not SO-IP, AD-*, TG-*, TL-* or any other type). Scope is the contacts in the batch being updated, not a sweep of the whole database, unless Karthik asks for a sweep (he has asked for a Manchester-area check only, never the full database).
+
+1. **Priority is P1 or P3 only.** Every SO-CF contact in the update must end with `cf_reachout_priority` P1 or P3. Existing P2 values on SO-CF contacts that are in the batch should be flagged and put to Karthik (ask P1 or P3), not left silently.
+2. **P3 means NA/Not Relevant.** Every SO-CF contact with priority P3 must have Reachout Status (`cf_rereachout`) = `NA/Not Relevant`. If it has any other status or none, update the status to `NA/Not Relevant` and say what it replaced in the report (note it overwrites any outreach history such as 1st Contact-Email/LI or Meeting Done VC, so list the old values before changing them).
+3. **No priority: ask.** If an SO-CF contact in the batch has no priority, do not guess. Ask Karthik which priority (P1 or P3) per contact, grouped in one multiple-choice question with my best guess first. Once he answers: P1 set as told; P3 set P3 and then set Reachout Status to `NA/Not Relevant` per rule 2.
+4. Contacts on the Manchester Google Sheet (CF Meeting Master, Advisors tab) are P1 by Karthik's earlier instruction; keep them P1.
+5. Include a short check line in the plan and the report: how many SO-CF contacts were checked, how many had no priority, how many P3s had the status corrected.
+
+How: the dry run of every `update-contact` and `create-contact` prints a `WARNING` for any SO-CF breach in the state it would leave, so none slips through. For a whole batch or view use `./fs check-contacts --ids ... | --emails ... | --view VIEW_ID --where ...`: it prints the exact counts for item 5 and lists each contact's problems. Its `--emit-batch fix.json` writes ONLY the mechanical fix (P3 status to `NA/Not Relevant`, with the old status recorded in `replaces`); list those old values to Karthik, then `./fs update-contact --batch fix.json` (dry run), then `--apply`. Set priorities with `--set cf_reachout_priority=P1` once he has chosen.
+
+## 0c. Every contact being updated needs City, LinkedIn and latest email (Karthik, Oct 2026)
+
+Any contact that is created or updated in a batch (any Contact Type, not only SO-CF) must finish with all three populated and current:
+
+1. **City** (`city`). The CLI refuses an empty city, so when Apollo has none (only a region such as Greater London) use the company's city and say so.
+2. **LinkedIn profile** (`linkedin`, slug only).
+3. **Latest email address** (the current work address, as primary).
+
+How:
+
+- Check at the start of the batch: `./fs check-contacts --ids ...` (or `contact IDS` for the full record) lists what is missing; the dry run also warns (`city is missing`, `LinkedIn is missing`, `email is missing`). List the gaps in the plan.
+- Use Apollo for the LinkedIn profile and the latest email: standard `apollo_people_match` (about 1 credit) using name plus company or domain, or the LinkedIn URL if known; for several people, free `apollo_mixed_people_api_search` then `apollo_people_bulk_match` by id (max 10 per call). Check `apollo_users_api_profile` (include_waterfall_capability) once per conversation. Ask before any waterfall.
+- City: use the email signature city where there is one, else the Apollo person city (note it may be stale, see section 4); say which source was used.
+- Where Apollo's email differs from the FS primary, show the mismatch in the plan and change it only after approval (`update-contact ID --set email=...`). Where Apollo has a different employer or no confident match, flag it and do not apply.
+- Contacts that are only being deleted or merged away are exempt; the surviving record gets checked.
+- Report line: how many contacts were checked, how many had a missing or changed city, LinkedIn or email, what Apollo filled, and the credits used and balance. List any that Apollo could not resolve.
+
+## 0d. Meeting transcripts and audio (Karthik, Oct 2026)
+
+Use this when Karthik gives a transcript, an audio file, or a recorded meeting (Plaud, Fireflies) for one or more meetings he has held. One meeting usually has one counterparty, but the notes may cover several deals. A day's recordings are often one long pipeline-review call plus several one-to-one meetings.
+
+**Inputs and getting text**
+
+- A pasted or uploaded transcript is used as it is.
+- Plaud recordings: `list_files` for the day, then `get_transcript` for each. Fireflies: `fireflies_search` or `fireflies_get_transcript`. Notion meeting notes: fetch them. Then treat the text as pasted.
+- Audio with no transcript: check the workspace for a speech-to-text tool first. If none is available, say so and ask for a transcript. Do not guess at what was said from audio you cannot transcribe.
+- **Transcripts are phonetic and garbled, so names are often wrong.** Examples from 20 Oct 2026: Expedia was Enthuse (bought by Access Group), ZephyrSoft was Zebsoft, Voluntiero was Volunteero, Group GROP was Groop, Early was Airly, Rostify was probably Rosterfy, Assembly was DutySheet/Assemble, Visysoft was VisiSoft, New Web Group was Nuweb, Lineup was Line-Up (Planvine Ltd), and "Farm to K R R" was probably "past £250k ARR". Before using a company or person name, verify it with `ch search-companies "NAME"` and `ch profile NUMBER` (Exa only if the API cannot answer), say in the plan which spelling you used, and flag any reading that is a guess. Karthik will correct names; re-run the affected notes with the corrected name.
+
+**Step 1: split the transcript**
+
+- Split into one block per meeting (by time slot, by a change of counterparty, or by an explicit "next meeting" break).
+- For each block, list the counterparty (name and company as best you can tell), the deals mentioned, any promises or actions, and the date and time if stated.
+- If a block gives a time slot, look up Karthik's Google Calendar for that slot (`list_events` for the day) and take the attendee names and emails from the matching event. Exclude Karthik and any @terncapital.com address. If several events overlap, list them and ask which one.
+- If there is no time slot, use the names in the notes and say the match is unconfirmed.
+
+**Step 2: match the person in Freshsales**
+
+- Look up the calendar attendee email first (`./fs lookup EMAIL`).
+- If it is not found, search by name (`find-contacts --name`), then by domain (`find-contacts --domain`).
+- The calendar email can differ from the FS email (a personal Gmail for a NED; a second company domain for the same person). That is fine: note on the FS contact that matched, flag the difference, and do not change the primary without approval (0a, Apollo-verified email).
+- If the same person exists twice (one record per domain), put the note on the record that is linked to the deal, and tell Karthik. When he says merge, `merge-contacts KEEP --with DUP` with KEEP the record on the deal (section 8). Add the note after the merge.
+- If there is still no clear match, ask before creating a contact. Create one only as a TG-Owner/Manager contact through the section 5 flow, with Reachout Status `Chase`, and only with Karthik's approval.
+
+**Step 3: contact notes**
+
+- Each person's notes, in the meeting's own words, go to their contact as a dated note: `./fs add-note CONTACT_ID "DD/MM/YYYY meeting: ..." --on contact`. For several notes use one batch file per transcript and one `--batch` call.
+- Keep the meeting's detail. Do not summarise it away. Put a short "action" line at the end if there are actions.
+- **Keep the personal details** (family, children and their ages, spouse and co-founder relationships, previous careers, where they live, age). Karthik wants these in the Freshsales note to learn about the person he is dealing with. Never strip them as sensitive; he objected when I did. This is about the person's own contact note from a meeting he attended.
+
+**Step 4: deals mentioned in the transcript**
+
+- For each deal named, run a fuzzy search before anything else: `./fs find-deals "stem,variant"`. Try the distinctive name stem, hyphen and space variants, any trading or legal name, and a likely misspelling. `find-deals` shows the name but not the stage, so read `./fs deal ID` for a hit (an existing hit may be Screened Out or parked, as Nuweb Group Ltd and Zebra Software Limited were).
+- **Deal already exists:** add the notes as a dated note on the deal, `./fs add-note DEAL_ID "DD/MM/YYYY: ..." --on deal`. Do not change its stage unless Karthik says so. Link the meeting's contact to the deal if they are not linked already (`link-deal-contacts DEAL --add CONTACT_ID`). A live deal with no contact needs one before any update (0a).
+- **Karthik says to reopen or assign an existing deal:** do as told: `update-deal ID --set owner="Karthik Dasari" --set deal_stage="04 Plan-Teaser-Chasing" --set cf_deal_stagelatest="10 Suspect" --set cf_chaser_status=Chase`, plus `--set cf_reject_reason="N/A"` if it was Screened Out, link a contact (a reopened deal is live, so it needs one), and add a dated note holding the old history (stage, owner, reject reason).
+- **Karthik asks to park an existing deal** (for example Zebsoft, GTM December 2027): set `cf_gtm_date` (use the 1st of the month, say so) and keep stage 52 Future-Followup; do not create a duplicate. Add the Todoist reminder for the same date.
+- **Deal does not exist and the notes say to add it:** run the full section 2 and 3 checks first (duplicate check, prior-contact check, fit screen). Then create it with section 6, using:
+  - contact linked: the meeting's person, or the owner/CEO found through section 4, with Contact Type `TG-Owner/Manager` and Reachout Status `Chase` (if the person is new, section 5 applies);
+  - Deal Status: stage `04 Plan-Teaser-Chasing`. Karthik's wording "Teaser/Prospect" and "prospect" means stage 04 with latest stage `20 Prospect` when he says prospect; otherwise leave the preset latest stage `10 Suspect` and say so in the plan;
+  - note with the meeting date and the source transcript summary.
+- **A list of companies raised in a call** (competitors, adjacent players, ticketing or volunteering targets): Karthik's instruction was to create every named company as a deal, then fit-screen each one and move the failures to Screened Out with the reason ("create all, then move to Screened Out"). Screened Out deals need no contact; the ones that pass are live and need a contact (0a). Include a one-line reason and source in the note. Companies he later says are not software (State of Life, social-value research) are deleted with `delete-deal`, not kept as Screened Out. A company he later asks to be assigned to him or set to prospect (Volunteero) becomes live and needs a contact.
+- **Losses:** if a target looks hugely loss-making, check Companies House before rejecting (net liabilities, loss for the year, going-concern). Small companies' filed accounts are often unreadable online; ask Karthik to open them or try the browser. Do not reject on losses without evidence. Reject reason `Tern-Losses Large` exists.
+- **Liquidation and status checks:** run `python3 ch company-all NUMBER --no-deep` (or `profile`, `filings`, `officers` and `psc` one at a time), and check the Gazette with Exa, since the API does not cover it. A "proposal to strike off" banner can be stale: look for the DISS40 (discontinued) entry. Note phoenix companies (Groop Ltd, liquidated May 2023, same director as Digital Communities Ltd, which now delivers Groop).
+
+**Step 5: follow-up emails (drafts only)**
+
+- Where the transcript records a promise to send something to someone (materials, a follow-up, an intro, a data request), draft the email in Superhuman using `create_or_update_draft` (`type: new`, `instructions` so the user's style is applied). Never call `send_draft`, `undo_send`, or any send tool.
+- Address the email to the contact's Freshsales primary email, or the verified calendar email if they differ (flag any mismatch).
+- Open with a preamble that fits the timing: "Good to meet you today" (in person) or "Good to speak today" (call), or "yesterday", followed by "As promised, ..." and the item. Keep the body short and in Karthik's voice, in British English, with no sign-off beyond his name.
+- If an attachment was promised and I do not hold it, leave a clear placeholder line ("[attach playbook]") and tell Karthik; do not invent attachments.
+- Subject line: state the purpose (for example "Deal lead generation playbook, as promised").
+- Report each draft by recipient and subject, and say it is waiting in Superhuman for Karthik to review and send.
+
+**Step 6: actions that are not emails**
+
+- Anything the transcript says Karthik needs to do that does not involve writing an email to someone else (a call to book, a document to prepare, an internal decision, a check on a figure, chasing an introduction, a reminder for a future date) goes on a list.
+- Show the list in the plan with the proposed task text, due date if stated, and project. Karthik's Todoist projects include Inbox, Fundraising, Sourcing, Deals, SC/JT/TLL/JH/SP/NP Actions (several are shared with colleagues); use Inbox unless he names one, and say so.
+- Add to Todoist (`add-tasks`) once Karthik confirms the list ("Add actions to Todoist" is the confirmation). Do not create duplicates of tasks already in Todoist: search first (`find-tasks` by company or person).
+- Items that involve emailing someone are not Todoist tasks. They are section 5 drafts. Items that are Freshsales changes the CLI cannot make (tags) are listed for Karthik, not tasked.
+
+**Plan and report for a transcript**
+
+- Plan (structured text, one confirmation per transcript): meetings found (time, counterparty, calendar match), where each note will go (contact name or deal name), deals to update or create (with the stage mapping and the contact each live deal will carry), name corrections and guesses, drafts to create, and Todoist tasks to add. Put the questions at the end.
+- Run every write as a dry run first and show it; apply after approval, one transcript at a time.
+- Report: contacts noted (with links), deals updated or created (with links, stage, fit call), drafts waiting in Superhuman (recipient and subject), tasks added to Todoist, and anything unmatched or unconfirmed. Include the API calls line from the last `./fs` command.
+
+## 1. Classify each input
+
+1. Contact with an email: look it up first. `./fs lookup a@x.com,b@x.com` (one search for up to 25 emails; add `--brief` when you only need "exists or not", which skips reading each contact). If the exact email is not found but a near match exists (same name or domain), show the mapping and ask before changing anything: `./fs find-contacts --name "First Last"` (or one word for a partial surname) and `--domain example.com`. **If a name search returns nothing, suspect a misspelling** (Karthik wrote "Sokrataus"; the record was Peter Sokratous): find the deal with `./fs find-deals "stem,variant"`, read its contacts with `./fs deal ID`, and confirm the match with him before deleting or editing. A name that is simply not in FS (Tom Palmer at Rothschild, Will Watt, Oct 2026) is reported as "not in FS, nothing to delete", not an error. `find-contacts --domain` stops at 100 results (it says so); for a complete domain list use `list-view VIEW --where domain=example.com`. **Name search alone is not proof of absence** (0f): also read the company's deal with `find-deals` then `deal ID` before saying someone is not in FS.
+2. Contact without an email: free Apollo search plus a standard match to find one. If still none, ask: waterfall, create with LinkedIn/mobile only (`create-contact ... --set mobile_number=...` with no email; the CLI accepts an email OR a mobile), or skip.
+3. Deal or company name only: run the full target flow (sections 3 to 6) including finding the shareholder and CEO.
+4. Account name only: decide by what the firm is. Advisor firm: find or create the Account. Software target: create a Deal instead (never an Account). Unclear: ask.
+5. Free-form edit instruction: apply as written (section 8).
+
+Then decide what the contact is by researching (website, Apollo organisation, Companies House). If still unclear, ask.
+
+| Contact is | Handling |
+|---|---|
+| Owner/manager of a software target | Deal plus linked contact (sections 3 to 6). Account is always Not Qualified. |
+| Corporate finance, M&A, accountancy or other advisor | Account for the firm plus contact under it (section 7). |
+| PE acquirer, search fund, investor, NED/chair, lender, lawyer, other | Always ask what to do (type, whether to create an Account). |
+| Email domain on the Tern portfolio list | Always ask for type, account and subscription each time. Domains: terncapital.com, novevasoftwaregroup.com, mindofmyown.org.uk, thomsonscreening.com, sofco.co.uk, metrofy.com, cadesignservices.co.uk, pimss.com, retail-manager.com, metabroadcast.com, prosper-design.com, charitylog.co.uk, ccube.cloud. Telsis and Telency are NOT portfolio. |
+
+Personal addresses (Gmail etc.): look up the person on LinkedIn/Apollo for the company; if you cannot find it, ask. Do not create a deal for an unknown company.
+
+**Sheet-sourced lists (Oct 2026).** When the list comes from a Google Sheet (for example the Owners tab of a deal-review sheet), read it with the Sheets connector and re-read it immediately before writing if anyone could have re-sorted it, because row numbers move while the notes travel with the rows. Match on company and contact name, not row number. Respect human-entered values in reject-reason and notes columns: append to notes, never overwrite. A Region column has no Freshsales field: do not store it, and say so in the plan.
+
+## 2. Pre-checks for every target (in this order, cheapest first)
+
+1. **FS duplicate check.** `./fs find-deals "stem,variant1,variant2"` (comma-separated, one call per term, up to about 5 terms; hits come back as `deals` and `sales_accounts` separately, so an empty account named like the company is a stray duplicate account, NOT a second deal). Search the distinctive name stem and variants (hyphens, spaces, legal vs trading name, brand vs company). Add `--details` only when you need stage or amount (one extra call per hit, first 10 per term). Two deals for one company: merge them by hand (section 8). **Same-name companies:** if the name is shared by unrelated businesses (Ticketline Manchester vs Ticketline Canada, Oct 2026), confirm which entity Karthik means (location, website, Companies House) before researching owners or linking anything. `create-deal` and `create-account` also refuse an exact duplicate name and warn about look-alikes (they strip trailing Ltd/Group; the dry run warned that "Nuweb Group Ltd" already existed as the NuTickets deal), but the search lags records created in the last few minutes.
+2. **Prior-contact check, always for targets.** FS deal owner, last contacted, activity and notes (`./fs deal ID` shows the deal's notes and contacts; `./fs contact ID` shows a contact's notes and deals); plus Superhuman `list_threads` by the company domain and by each contact email. Report who contacted them, whether they replied and the gist. Informational; does not block. A prior reachout status such as "3rd Contact-Email/LI" means a re-approach: say so (Clarus was treated this way in the Manchester batch).
+3. **Fit screen** (section 3).
+
+### Existing deal found
+- Link the contact to it automatically: `./fs link-deal-contacts DEAL_ID --add CONTACT_ID`. It APPENDS (ids already linked are harmless), so there is nothing to read first, and it never replaces the list. Use `--remove` to unlink. The deal's contacts are read back and must equal the intended set.
+- Do NOT reopen automatically. If the stage is 06, 52, 02, 68, 72 or 76, link the contact, report the stage and leave it. Karthik reopens by instruction: `./fs update-deal ID --set stage="04 Plan-Teaser-Chasing" --set cf_deal_stagelatest="10 Suspect" --set owner="Karthik Dasari" --set cf_chaser_status=Chase`, plus a dated note holding the old history (`add-note ID "..." --on deal`). The reopen is `--set deal_stage=...` in some CLI versions; if one name is refused the CLI says so. Clear a Screened Out reason with `--set cf_reject_reason="N/A"`.
+- Contact owner follows deal owner; say so in the report.
+- **Replacing a contact (Oct 2026):** when Karthik says to add new contacts and remove an old one (Bolster: three owner/directors added, Joseph Bramwell removed; Ticketline: Peter Sokratous removed), add and link the new contacts first, verify the links, then unlink and delete the old contact (`link-deal-contacts DEAL --remove OLD`, then `delete-contact OLD`; the guards in section 8 apply). Keep exactly one primary contact on the deal.
+
+## 3. Fit screen
+
+Work out what the company does from its website. Tests: (1) ownership/independence via Companies House PSC (follow corporate PSCs up the chain; a minority VC/PE stake with founders in control is a judgement call, show the cap table); (2) vertical software, not horizontal; (3) UK or Ireland HQ; (4) size c. £0.5-3m ARR. Unknown size is NOT a reject: proceed and flag it. Acquired companies fail on ownership (Enthuse, bought by Access Group; DutySheet/Assemble, Access Group): `Tern-OS Large Parent`. A licensee of an overseas owner (Trybooking UK) fails on location. A product that is a division of a group (VisiSoft inside The HBP Group) is `Tern-Not Right Fit`. A tiny company with no turnover (Groop / Digital Communities Ltd) is `Tern-Rev Small`.
+
+- **Horizontal (HMS) test (Karthik, 15 Oct 2026):** if the product works the same across sectors and the customer is defined by an IT or back-office function rather than an industry, it is horizontal market software, not vertical (VMS). Interlink Software (vendor-neutral AIOps/IT monitoring layered over other tools, sold to banks, payments and infrastructure operators) is the reference example. Reject reason `Tern-HMS`.
+- **Hardware (Karthik, 15 Oct 2026):** a hardware business, or hardware-led with software as an add-on (ICC Solutions), is not the right fit. Reject reason `Tern-Not Right Fit`.
+- **Clearly not software** (reseller, agency, recruitment, property, manufacturing with no product, research or consultancy such as State of Life, and no history in FS): never create it. If it already exists in FS with no outreach or notes of value, delete it and report exactly what went (IDs, what was linked). `delete-deal` refuses a deal that has notes; its contacts stay and are only unlinked, so delete the deal first, then each contact (`delete-contact` refuses a contact still on a live deal or with notes, which is the contact protection in section 8). The dry run lists what goes. Borderline (tech-enabled services, unclear): ask first. If it was created by mistake in the same session and Karthik says delete it, delete it and report.
+- **Karthik says "reject", "not the right fit" or "screen out" on an existing deal:** do NOT delete. Move it to Screened Out with the matching reject reason and a dated note: `./fs update-deal ID --set stage="02 Screened Out" --set cf_deal_stagelatest="05 Screened Out" --set cf_reject_reason="Tern-Not Right Fit"` (or `Tern-HMS` for horizontal) and `add-note ID "..." --on deal`. If he also says to remove the contact, delete it after the contact-protection check. If outreach was already sent to the contact, use stage `68 Rejected-By Tern-Notified` instead and say so; if none was sent, stage 02 (Workstars Global, Oct 2026: no outreach sent, so stage 02, reject reason Tern-Not Right Fit, contact Jason Harney deleted). Then tell him any unsent Superhuman draft to that contact is stale and ask whether to discard it.
+- **Other fit failures** (PE/VC-owned, parent-owned, listed, non-UKI, horizontal, too small or large) for a company not yet in FS: create the deal as Screened Out with the right reject reason, no contacts, no Apollo spend (Karthik confirmed on 20 Oct 2026 that Screened Out deals do not need a contact): `./fs create-deal --preset target-deal --set name="..." --set stage="02 Screened Out" --set cf_deal_stagelatest="05 Screened Out" --set cf_reject_reason="Tern-OS Large PE" --set cf_website=domain`. This applies even when Karthik names the company. Include a one-line reason with sources in the deal note (`add-note`).
+
+Reject reasons (`cf_reject_reason`): `Tern-OS Large PE`, `Tern-OS Large Parent`, `Tern-OS Public`, `Seller-Sold`, `Tern-Non UKI Location`, `Tern-HMS` or `Tern-Not Right Fit` (horizontal), `Tern-Rev Small`, `Tern-Rev Large`, `Tern-Losses Large`, `Tern-Other`, `Tern-Reseller/Managed Services/Not Software` (only if keeping a record). The CLI checks the value against the live list.
+
+Industry (`cf_industry`, best single value): Healthcare/Public Sector, Public Sector, Retail, Transportation, Real Estate, Hospitality, Industry Agnostic, Education, Energy & Utilities, Financial Services, Manufacturing, Media, Other/Unknown (last resort), Professional Services, Telecoms, Compliance, Niche ERP.
+
+## 4. Find people for a target
+
+For every live deal that has no contact (0a), and wherever Karthik asks for the owners (as with Bolster and Ticketline). Shareholder from the Companies House PSC register (individual with the largest holding; follow the chain up through corporate PSCs: Ticketline resolved through Betesh Management Ltd and Orbit Tickets Group Ltd), and CEO via `apollo_mixed_people_api_search` (domain first, then keywords with UK location; the company's website is often a different domain from Companies House, such as volunteero.org). When there is no registrable PSC (Planvine), use the directors who are the founders. PSCs and officers come from `python3 ch psc NUMBER` and `ch officers NUMBER`; the company's own About page names the founders. Dedupe against FS first (`lookup ... --brief`, `find-contacts --name/--domain`) and reuse existing contact ids, after checking they are the right person. Show roles, evidence and credit cost, and get approval before any waterfall. A contact needs an email or a mobile. If the owner has no Apollo record (Jose San Miguel Santamaria), link the other owner and flag the gap.
+
+**Waterfall results can be poor.** For the Ticketline owners the waterfall returned invalid or abuse-flagged addresses (about 5 credits). When the results are weak, show them and ask: add anyway flagged as unverified, or skip. If Karthik chooses to add, create the contact with the best address, say in the contact and deal notes that the email is unverified or guessed, and do not spend more credits. Other contacts with no email at all (Linda Betesh) are not added.
+
+**If Apollo gives no usable result, search with Exa, then ask (0f).** Apollo can return no people, only junior staff, a low-confidence match, or someone whose current employer has changed. Use Exa (`category:people`, the company's site and press pages, theorg.com, LinkedIn announcement posts) to find the current CEO or owner, cross-check with `ch officers`, and verify the email with an Apollo match on the LinkedIn URL. Directors on Companies House may be non-executives or investors, and the CEO may not be a director.
+
+Check the contact's own location and title as well as the company's: Apollo person city and title come from LinkedIn and can be stale (the Manchester batch found contacts in Toronto and Edinburgh for Manchester-area companies, and a contact who had moved company). Use the signature city where there is one and note the source.
+
+## 5. Create target contacts
+
+`./fs create-contact --preset target-contact --set first_name=... --set last_name=... --set email=... --set job_title=... --set linkedin=SLUG --set mobile_number=... --set city=... --set country=... --set cf_primary_contact=true ...`
+
+The preset sets: owner Karthik Dasari (or the deal owner, see 0a: `--set owner=...`), lifecycle Lead with status Unqualified Leads, Contact Type `TG-Owner/Manager` (all target contacts, including hired CEOs; never TL-* for target people), `cf_reachout_final_statustargets` Unqualified, `cf_rereachout` Chase, subscription Deal Announcements only, and the account Not Qualified (primary). All of that is set in the one create call and checked from its response. Also set, from Apollo: `cf_apollo_person_id`, `cf_seniority`, `cf_email_status`, `cf_linkedin_headline`, and Apollo's company fields as available. `cf_primary_contact=true` on exactly ONE contact per deal (shareholder/owner first, else CEO/MD; keep an existing primary). Job title from Apollo when match confidence is high; LinkedIn slug only; city from the signature where there is one.
+
+Link to the deal with `create-deal ... --set contacts=ID1,ID2` (new deal) or `link-deal-contacts DEAL --add ID` (existing deal), then run `./fs contact ID` for each if you want to confirm the Not Qualified account and subscription survived the link.
+
+Use the name the person actually goes by (Dave rather than David) in the first-name field only if the company site or LinkedIn confirms it; otherwise keep the legal name and note the preferred name in the deal note so outreach greets them correctly.
+
+Existing contact with gaps: fill blanks from high-confidence Apollo or signature data with `update-contact` and fix clear errors (periods or initials in names, `-1` titles, garbled characters, email-as-name). List conflicts with non-empty values for Karthik (the dry run flags every `OVERWRITE`). Apollo match confidence low with empty employment history is not safe to apply. Existing target contacts with subscription `1;2;3;4;5` or the wrong account get fixed automatically (`--set subscription_types="Deal Announcements" --set sales_account="Not Qualified"`); advisors do not.
+
+Clearing a field: `--set job_title=` (works for standard and custom fields).
+
+## 6. Create the deal
+
+`./fs create-deal --preset target-deal --set name="..." --set contacts=ID1,ID2 --set cf_website=https://domain --set cf_industry="..." ...`
+
+A live deal needs its contact first (0a): create the contact, then the deal with `--set contacts=...`, or create the deal and link straight away and verify the link before moving on. Screened Out deals are created without contacts.
+
+The preset sets: amount -1 (unknown), owner Karthik Dasari, pipeline All Tern Deals, stage `04 Plan-Teaser-Chasing`, `cf_deal_stagelatest` `10 Suspect`, `cf_chaser_status` Chase, `cf_source_deal` Direct (`Intermediary` only if told, then link the advisor contact after confirming the match), `cf_status` Healthy, `cf_deal_type` Standalone, Bolt-on Yes, Bolt-on Platform Other, and currency GBP (`currency_id`; there is no `cf_deal_currency` field on deals).
+- Name: trading name as on the website, no Ltd or Limited (keep a suffix only to disambiguate, as in "Groop (Digital Communities Ltd)" or "Line-Up (Planvine Ltd)").
+- Website as `https://domain` in `cf_website`; Industry from section 3.
+- Headcount (`cf_headcount`) only when blank and from Apollo or the website; flag stale values (do not overwrite). Never fill revenue or ARR (`cf_rev_ltm`, `cf_ea_ltm`, `cf_arr`) unless supplied.
+- Write a dated evidence note on every deal created or changed: `./fs add-note DEAL_ID "DD/MM: ..." --on deal`. It holds ownership evidence, prior-contact result, fit judgement and flags, reopen history, what was changed, and any unverified emails.
+
+The create call verifies every field from its own response, including the contact links, and prints the deal's link. Report `https://tern.freshworks.com/crm/sales/deals/ID`.
+
+## 7. Advisor contacts and accounts
+
+1. Find the firm's Account: `./fs find-deals "Firm name,variant"` (the `sales_accounts` list) and `./fs account ACCOUNT_ID` (the account with all its contacts and deals, which also shows who is already there). Firms rebrand and merge; link to the existing account rather than creating a duplicate and say which was used. **Group overlaps (Oct 2026):** a firm may now sit inside a larger group already in FS (Kay Johnson Gee is part of Xeinadin; Moore & Smalley is part of MHA). Check the group account (Xeinadin Group account 113000455575) and say when two contacts for "different" firms are really at the same group. For outreach, Karthik wants ONE email per group, to the most senior contact (Xeinadin: Alex White, Managing Partner North West, chosen over Paul Whitney, Head of CF). Keep the other contact in FS unless told to delete.
+2. If none: `./fs create-account --preset advisor-account --set name="Exact Firm Name" --set "cf_type=SO-CF" --set website=domain --set city=... --set country="United Kingdom"`. Account Type values look like `SO-CF` or `AD-A&T;SO-CF` (`;` between them, not a comma). Use the firm name exactly as Karthik gives it, and offer a rename if Apollo spells it differently (Debrett vs Debrett's, Oct 2026); rename with `./fs update-account ID --set name="..."` (it refuses a name another account already has).
+3. Contact Type: infer from the firm and show it for approval. Corporate finance or M&A adviser SO-CF; accountancy AD-A&T (plus SO-CF if they do M&A); law firm AD-Legal Employment, General, IP or Restructuring; other AD-* or SO-* by service. **There is no `TL-NED` option in FS** (Oct 2026): for a NED or non-executive use the closest, `TL-NonExec`, and tell Karthik. Valid TL options are TL-CCO/CEO/CFO/COO/CRO/CSO/CTO, TL-NonExec, TL-Other, TL-Tern Principals. The CLI rejects anything else and prints the full list.
+4. Statuses: cold add = Chase plus Unqualified (the `advisor-contact` preset). If an email thread shows an invite sent, Meeting Setup plus Active Discussion; if he is actively corresponding, Active Discussion. Otherwise ask. After Karthik confirms an advisor email has been sent, set Reachout Status `1st Contact-Email/LI` (and the priority per 0b).
+5. Create the advisor contact: `./fs create-contact --preset advisor-contact --set first_name=... --set last_name=... --set email=... --set job_title=... --set city=... --set linkedin=SLUG --set sales_account="Exact Account Name" --set cf_contact_type_newct=SO-CF --set cf_reachout_priority=P1 --set cf_commentsnext_steps="why added; email source (Apollo-verified or pattern guess)"`. Search for the person first (step 1 of section 1). The account is linked as primary in the same call. `sales_account=` needs the EXACT existing name; if the account was created in the last few minutes the search may not see it yet, so wait and retry. Then apply 0b and 0c.
+6. Move an advisor to a new firm or address (Alex Kelly to MHA, Matt Beckley to DJH): `./fs update-contact ID --set email=new@firm.com --set sales_account="New Firm" --set job_title=... --set city=... --set cf_commentsnext_steps="was at Old Firm, old@x.com"`. The old address stays as a secondary and the dry run shows it. If the new firm has no Account in FS, create it first (step 2).
+7. **Replacing an advisor Karthik tells me to drop:** find the best or most senior CF contact at the firm (Apollo free search by domain, seniority partner/director, then `apollo_people_bulk_match` by id for the verified email), check FS and the Reachout Status first (`lookup EMAIL`), create them, then delete the old contact (section 8). If the firm turns out to be part of a group already in the batch, flag the overlap and keep only the more senior person for outreach.
+8. **BCC duplicates (Oct 2026):** sending to an address FS does not hold makes the BCC create a blank duplicate contact. If `update-contact --set email=` then refuses with "already belongs to contact N", merge the blank duplicate into the real contact: `./fs merge-contacts REAL_ID --with BLANK_ID` (dry run first), then retry.
+
+## 8. Edits, merges, reopens and deletes
+
+- Free-form edits (rename, owner, stage, field values, notes): do as instructed (`update-contact`, `update-deal`, `add-note`), verify from the table, add a dated note. Flag conflicts (e.g. a future GTM date) but do not block. A live deal edit still needs a linked contact (0a).
+- **Merge** duplicate deals: keep the richer record (the one with contacts and most data, or the one Karthik names, e.g. the P3 record), carry over useful comments/fields from the other (append to `cf_comments__next_steps_upto_2_lines`, and state conflicts such as differing GTM date or revenue rather than silently choosing), move contacts across (`link-deal-contacts KEEP --add ...`, then `--remove` on the twin), list what moved, and delete the empty twin only when `delete-deal` allows it (it has no notes). There is no deal-merge command.
+- **Merge** duplicate contacts: `./fs merge-contacts KEEP_ID --with DUP_ID[,DUP_ID]`. The dry run lists what will move (emails as secondary, notes, deal links) and what is filled or dropped: the kept contact keeps every value it already has and takes the duplicate's only where its own is blank, so name the richer record as KEEP, and prefer the record already linked to the deal (David Bowman, Oct 2026: KEEP was the contact on the Zebsoft deal, the duplicate carried the calendar address, which came across as a secondary). It is permanent. After `--apply` the command waits for Freshsales' background job (it re-reads a few times) and reports `verified` or `PENDING`; on PENDING tell Karthik and re-check with `contact KEEP_ID` later. Report the old ids. Put queued notes on the surviving id (patch the batch file) and offer to make the better address primary.
+- **Delete** (permanent; there is no restore and no "forget"): only when Karthik says delete, or for clearly non-software targets with no history (section 3). The dry run shows exactly what goes (record, its deals with stage, its notes) and what blocks it. The CLI enforces Karthik's guards:
+  - a **contact** is refused if it is on a **live deal** (anything except Screened Out, Rejected, Sold) or has **notes** (a deal's notes count as its contacts' notes). To get past the live-deal guard, unlink first with `link-deal-contacts DEAL --remove CONTACT`, which needs Karthik's say-so; notes are history and block with no override. A contact with meetings you know of from Superhuman or Fireflies also deserves a question even though the CLI cannot see them;
+  - a **deal** is refused if it has **notes**; its contacts stay and are only unlinked;
+  - an **account** is refused while it has **contacts or deals**;
+  - a batch is all-or-nothing, so one blocked id means nothing is deleted.
+  Delete contacts with `./fs delete-contact ID [ID...]`, deals with `delete-deal`, accounts with `delete-account`. When Karthik explicitly says to remove a named contact (Peter Sokratous, Jason Harney, Joseph Bramwell, and advisors such as Steven Lindsay, Steve Crossley, Peter Anderson, Nathan Heathcliff-Core), run the dry run, apply it, and report the id and what it was linked to (it is in the output). When he gives an email list to delete, `lookup` each email first so the report names the person. When he says to delete a firm's contact and its account (Verus Corporate Ventures), delete the contact first, check the account has no other contacts or deals (`./fs account ID`), then `delete-account`. After any advisor delete, check whether an unsent Superhuman draft to that person exists and discard it (or tell him).
+  Anything I would decide to remove myself is NOT deleted: list it for Karthik instead (tags are not supported by the CLI).
+- **Replacing a contact on a deal:** add and link the new contact first, verify, then unlink and delete the old one. If the old one is still an active Companies House director, or has notes, tell Karthik before removing or deleting (0f).
+
+## 9. Report
+
+Structured text first, per record: deal name, id and link (`https://tern.freshworks.com/crm/sales/deals/ID`), live or Screened Out and why; contacts created, linked or fixed with ids and links (`/crm/sales/contacts/ID`); prior-contact findings; merges, deletes and reopens (old ids, what moved or went); defaults used; Apollo credits used (add up `credits_consumed` from each response) and balance (say "unconfirmed" when there is no `mcp_credits` block); verification result (all `ok`, or the `DID NOT TAKE` rows); the SO-CF priority/status check line (0b); the city/LinkedIn/email check line (0c); failures; open flags (including unverified emails, `PENDING` merges, stale Superhuman drafts for rejected targets, and any live deal still lacking a contact); and the **API calls line** from the last command (what was spent and what the account has left). For 10 or more records also deliver a CSV (reachout status, name, deal, title, area, location, email, LinkedIn, reject reason, comments, headcount, revenue, industry), validated for column count before sending.
+
+## Fixed names and gotchas
+
+- Owners (by name in `--set owner=`): Karthik Dasari, Simon Corson, James Hang, Joanna Te, Tom Llewellyn-Lloyd, Damian Lee, Francis Gordon. (Ids: Karthik 13000009586, Simon 113000000486, James 113000000483, Joanna 13000052361, Tom 13000052259, Damian 13000042446, Francis 13000052683.)
+- The Not Qualified account is named exactly `Not Qualified` (id 13005231493). Subscription types: Deal Announcements = 2 (the others: 1 Non-marketing emails, 3 Promotional, 4 Team Updates, 5 Tern Academy).
+- Stage names for `--set stage=` (pipeline All Tern Deals), verified 26 Oct 2026: `02 Screened Out`, `04 Plan-Teaser-Chasing`, `06 Plan-Future-No ResponseA4`, `12 Plan-Awaiting Info`, `20 Live-Prospect`, `24 Live-Initial Review`, `28 Live-Mgmt Meeting`, `32 Live-DD`, `36 Live-IOI`, `40 Live-LOI`, `48 Live-DD & Closing`, `52 Future-Followup`, `68 Rejected-By Tern`, `72 Rejected-By Seller`, `76 Sold-To Other`, `80 Sold-To Tern`. This is the live list the CLI cached on 31 Oct 2026; it has no 18, 44, 54 or 64, so earlier notes naming `18 Live-GTM`, `Live-LOI Stage 1/2` or `54 Future-Followup W6M` were out of date or from another view. Always take the exact names from the CLI's `Valid:` list. Older stage numbers elsewhere in this file are out of date. `cf_deal_stagelatest` values: `05 Screened Out`, `10 Suspect`, `20 Prospect`, `30 Mgmt Meeting/DD`, `40 IOI - Verbal`, `41 IOI - Written`, `42 LOI Signed`, `50 Closing`, `90 Closed-Tern Rejected`, `92 Closed-Seller Rejected`, `94 Closed-Won`.
+- `update-contact` sends only the fields that change, and the dry run shows `same` for the rest. A read-back mismatch is a real failure to report, not noise. Dates and phone numbers are compared ignoring the formatting Freshsales applies (`2026-11-01` comes back as a timestamp, `020 0000 0000` loses its spaces).
+- `--set` values containing spaces need quotes. Multi-selects use `;`. Names are case-sensitive for picklists.
+- Search (lookup, find-deals, duplicate checks) lags records created in the last few minutes.
+- A new contact needs a first name and an email OR a mobile number.
+- LinkedIn fields take the slug only. Companies House data comes from the `ch` CLI, not Exa.
+- Apollo company domain can differ from the website; search by keywords if the domain returns nothing.
+
+## Zapier action to `fs` command
+
+| Zapier action | `fs` command |
+|---|---|
+| get_contacts_reachout_status, search_contact_v2 | `lookup EMAILS [--brief]` |
+| search_contacts_by_name, find_contacts_for_accounts | `find-contacts --name/--email/--city/--type/--domain` |
+| export_contact_rows | `contact IDS` |
+| export_deal_rows, verify_deal_links | `deal IDS` (and every create/link verifies itself) |
+| fuzzy_search_deals, Find Deal, Find Account | `find-deals TERMS [--details]` |
+| get_account_contacts_and_deals, contacts_by_account_filter | `account ID` |
+| list_view_contacts, list_contacts_by_type_and_city, find_contacts_by_job_title_keywords | `list-view VIEW --where ... --fields ...` (and `views`) |
+| create_contact_action, create_contact_no_email | `create-contact --preset ...` |
+| update_contact_action_new, set_contact_account_and_subscription, clear_contact_job_title | `update-contact ID --set ...` |
+| set_contact_primary_email | `update-contact ID --set email=...` |
+| create_deal_action, update_deal | `create-deal`, `update-deal` |
+| create_account_action | `create-account --preset advisor-account` |
+| update_account | `update-account ID --set name=... --set "cf_type=SO-CF;AD-A&T" ...` |
+| create_note, add_note_contact | `add-note ID TEXT --on contact|deal|account` |
+| Update Deal `contacts_added_list` (it REPLACED the list) | `link-deal-contacts DEAL --add/--remove` (it appends and removes) |
+| merge_contacts | `merge-contacts PRIMARY --with IDS` |
+| delete_contact, delete_deal, delete_sales_account | `delete-contact`, `delete-deal`, `delete-account` (guarded) |
+| Create Task / Meeting / Sales Activity / custom modules | not in the CLI: ask |

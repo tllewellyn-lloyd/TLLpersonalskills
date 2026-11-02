@@ -1,0 +1,3 @@
+scripts/api_key.txt
+__pycache__/
+*.pyc

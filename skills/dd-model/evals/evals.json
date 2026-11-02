@@ -1,0 +1,13 @@
+{
+  "skill_name": "dd-model",
+  "evals": [
+    {
+      "id": 0,
+      "prompt": "Build the DD model for Asset Guardian from the seller data folder. The dataroom files (IM, abridged accounts FY23-25, management accounts 25/26, updated P&L, revenue by customer, staff breakdown & costs, customer tenure, accrual figures, plus qualitative docs) are in the input folder. Target has a March year end. Produce the master Excel workbook.",
+      "expected_output": "Asset Guardian Master.xlsx following Tern conventions (Nunito 11 house formatting): L (tab map only, no change log/dataroom index), PL starting on row 1 with FY..A/F columns, year end in C3, Grouping column, Tern Y1 mirroring the current-year forecast with payroll built from CB via SUMIFS on the K or N flag, no Difference/CAGR columns; CB listing ending at fully loaded cost plus K or N and both C&B reconciliations; R with gross churn as its own section; provenance-labelled sections; QA data requests with priority (including contractor double-count and forecast support as Critical); disagreeing source files ingested side by side with a (Tern) reconciliation; cached values written back so the file renders in Drive",
+      "files": [
+        "/mnt/user-data/uploads/H260423 - Asset Guardian Solutions - KBS"
+      ]
+    }
+  ]
+}
